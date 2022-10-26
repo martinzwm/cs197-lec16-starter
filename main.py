@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
+import time
+import wandb
 
 
 class Net(nn.Module):
@@ -34,9 +36,10 @@ class Net(nn.Module):
         return output
 
 
-def train(args, model, train_loader, optimizer, epoch):
+def train(args, model, train_loader, optimizer, epoch, device):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
         loss = F.nll_loss(output, target)
@@ -50,22 +53,25 @@ def train(args, model, train_loader, optimizer, epoch):
                 break
 
 
-def test(model, test_loader):
+def test(model, test_loader, device):
     model.eval()
     test_loss = 0
     correct = 0
     with torch.no_grad():
         for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
+    test_acc = 100. * correct / len(test_loader.dataset)
 
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+        test_acc))
+    return test_loss, test_acc
 
 
 def main():
@@ -98,6 +104,15 @@ def main():
 
     train_kwargs = {'batch_size': args.batch_size}
     test_kwargs = {'batch_size': args.test_batch_size}
+    
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    if use_cuda:
+        cuda_kwargs = {'num_workers': 100,
+                       'pin_memory': True,
+                       'shuffle': True}
+        train_kwargs.update(cuda_kwargs)
+        test_kwargs.update(cuda_kwargs)
 
     transform=transforms.Compose([
         transforms.ToTensor(),
@@ -110,14 +125,40 @@ def main():
     train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
-    model = Net()
+    model = Net().to(device)
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+    
+    # Initialize wandb
+    wandb.init(
+        project="cs197a4",
+        config={
+            "epochs": 10,
+            "batch_size": 128,
+            "lr": 1e-3,
+            "dropout": 0.5,
+        }
+    )
+    config = wandb.config
+        
     for epoch in range(1, args.epochs + 1):
-        train(args, model, train_loader, optimizer, epoch)
-        test(model, test_loader)
+        start_time = time.time()
+        train(args, model, train_loader, optimizer, epoch, device)
+        test_loss, test_acc = test(model, test_loader, device)
         scheduler.step()
+        training_time = time.time() - start_time
+        print("Elapsed time for training epoch {} is {}".format(epoch, training_time))
+        
+        # log validation stats every epoch
+        wandb.log({
+            "val/val_loss": test_loss,
+            "val/val_acc": test_acc,
+            "train/time": time.time() - start_time,
+        })
+        
+    # Finish and restart for each run
+    wandb.finish()
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
